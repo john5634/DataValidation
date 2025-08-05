@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CSV Labeling & Classifier Trainer</title>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/nikolajkh/regex-generator@latest/regexgen.min.js"></script>
+  <style>
+    body { font-family: Arial; padding: 1em; }
+    .hidden { display: none; }
+    .tabs button { margin-right: 10px; padding: 8px 12px; cursor: pointer; }
+    .active-tab { background-color: #ddd; }
+    .label-btn { margin: 0 4px; }
+    #reportBtn, #generateRegexBtn { padding: 10px; margin-top: 10px; }
+    #regexBox { white-space: pre-wrap; background: #f0f0f0; padding: 1em; border: 1px solid #ccc; margin-top: 10px; }
+    th { cursor: pointer; }
+    td.editable { cursor: pointer; }
+    td.editable:hover { background-color: #eef; }
+    table { border-collapse: collapse; margin-bottom: 20px; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; }
+    .negative-values-box, .positive-values-box { width: 100%; height: 80px; margin-top: 5px; white-space: pre-wrap; background: #f9f9f9; border: 1px solid #ccc; padding: 5px; font-family: monospace; }
+    .manual-table td:first-child { width: auto; max-width: 500px; word-break: break-word; }
+    hr { margin: 30px 0; }
+  </style>
+</head>
+<body>
+
+<div class="tabs">
+  <button onclick="switchTab('classification')" class="active-tab">Manual Classification</button>
+  <button onclick="switchTab('results')">Predicted Output</button>
+</div>
+
+<div id="classificationTab">
+  <h2>Train Classifier</h2>
+  <input type="file" id="csvFile" accept=".csv" multiple><br><br>
+  <select id="columnSelector"></select>
+  <div id="rowsContainer"></div>
+  <button id="generateRegexBtn">Generate Regex</button>
+  <div id="regexBox"></div>
+</div>
+
+<div id="resultsTab" class="hidden">
+  <h2>Test Classifier on New CSVs</h2>
+  <input type="file" id="testCsvFile" accept=".csv" multiple><br><br>
+  <button id="reportBtn">Download Negative Report</button>
+  <div id="resultsTable"></div>
+</div>
+
+<script>
+let allFilesData = [];
+let parsedData = [];
+let labels = {};
+let classifiers = {};
+let storedColumnIndex = 0;
+let resultsHeaders = [];
+
+function extractFeatures(text) {
+  text = String(text || "").trim();
+  const chars = Array.from(text);
+  const words = text.split(/\s+/);
+  const uniqueChars = new Set(chars);
+  const digitMatches = text.match(/\d/g) || [];
+  const alphaMatches = text.match(/[A-Za-z]/g) || [];
+  const nonAsciiMatches = text.match(/[^\x00-\x7F]/g) || [];
+  const specialSymbols = "!@#$%^&*()_+-=[]{}|;:'\",.<>/?`~\\".split('');
+  const countOccurrences = c => (text.split(c).length - 1);
+
+  const counts = {};
+  for (const c of specialSymbols) {
+    counts[c] = countOccurrences(c);
+  }
+
+  const featureVector = [];
+
+  // Lengths
+  featureVector.push(text.length);                                // 0
+  featureVector.push(words.length);                               // 1
+  featureVector.push(chars.length);                               // 2
+  featureVector.push(uniqueChars.size);                           // 3
+  featureVector.push((text.match(/\s/g) || []).length);           // 4
+
+  // Character class counts
+  featureVector.push(digitMatches.length);                        // 5
+  featureVector.push(alphaMatches.length);                        // 6
+  featureVector.push((text.match(/[A-Z]/g) || []).length);        // 7
+  featureVector.push((text.match(/[a-z]/g) || []).length);        // 8
+  featureVector.push(nonAsciiMatches.length);                     // 9
+
+  // Repetition patterns
+  featureVector.push((text.match(/(.)\1{2,}/g) || []).length);    // 10 (3+ repeated chars)
+  featureVector.push((text.match(/..*?\1/g) || []).length);       // 11 (any repeated pattern)
+
+  // Positional properties
+  featureVector.push(/^\d+$/.test(text) ? 1 : 0);                 // 12: only digits
+  featureVector.push(/^[A-Za-z]+$/.test(text) ? 1 : 0);           // 13: only letters
+  featureVector.push(/^\W+$/.test(text) ? 1 : 0);                 // 14: only symbols
+  featureVector.push(/^[Xx]+$/.test(text) ? 1 : 0);               // 15: only X/x
+  featureVector.push(/^[0]+$/.test(text) ? 1 : 0);                // 16: all zeros
+
+  // Common pattern checks
+  featureVector.push(/@/.test(text) ? 1 : 0);                     // 17: looks like email
+  featureVector.push(/https?:\/\//.test(text) ? 1 : 0);           // 18: contains URL
+  featureVector.push(/\(\d{3}\) \d{3}-\d{4}/.test(text) ? 1 : 0); // 19: phone number format
+  featureVector.push(/\d{5}(-\d{4})?$/.test(text) ? 1 : 0);       // 20: ZIP code
+  featureVector.push(/\d+\.\d+/.test(text) ? 1 : 0);              // 21: decimal number
+  featureVector.push(/\d{2}\/\d{2}\/\d{2,4}/.test(text) ? 1 : 0); // 22: date MM/DD/YYYY
+
+  // Casing and structure
+  featureVector.push(text === text.toUpperCase() ? 1 : 0);        // 23: all upper
+  featureVector.push(text === text.toLowerCase() ? 1 : 0);        // 24: all lower
+  featureVector.push(/^[A-Z][a-z]+$/.test(text) ? 1 : 0);         // 25: capitalized
+  featureVector.push(/[A-Z][a-z]+ [A-Z][a-z]+/.test(text) ? 1 : 0); // 26: full name
+
+  // Symbols and punctuations
+  specialSymbols.forEach(sym => featureVector.push(counts[sym])); // 27–86 (60 symbols)
+
+  // Token characteristics
+  featureVector.push(Math.max(...words.map(w => w.length || 0))); // 87: longest word
+  featureVector.push(words.reduce((acc, w) => acc + (w.length || 0), 0)); // 88: total word char count
+  featureVector.push(words.filter(w => w.length > 10).length);    // 89: long word count
+  featureVector.push(words.filter(w => /\d/.test(w)).length);     // 90: words with digits
+  featureVector.push(words.filter(w => /^[A-Z]/.test(w)).length); // 91: capitalized words
+
+  // Char class ratios
+  const safeDivide = (a, b) => b === 0 ? 0 : a / b;
+  featureVector.push(safeDivide(digitMatches.length, text.length));    // 92
+  featureVector.push(safeDivide(alphaMatches.length, text.length));    // 93
+  featureVector.push(safeDivide(nonAsciiMatches.length, text.length)); // 94
+  featureVector.push(safeDivide((text.match(/_/g) || []).length, text.length)); // 95
+  featureVector.push(safeDivide((text.match(/[^\w\s]/g) || []).length, text.length)); // 96
+
+  // Entropy (simplified Shannon entropy estimate)
+  let freq = {};
+  for (let c of chars) freq[c] = (freq[c] || 0) + 1;
+  const entropy = Object.values(freq).reduce((acc, count) => {
+    const p = count / chars.length;
+    return acc - p * Math.log2(p);
+  }, 0);
+  featureVector.push(Number.isFinite(entropy) ? entropy : 0); // 97
+
+  // Starts/ends with
+  featureVector.push(/^[\d]/.test(text) ? 1 : 0); // 98
+  featureVector.push(/[\d]$/.test(text) ? 1 : 0); // 99
+  featureVector.push(/^[A-Z]/.test(text) ? 1 : 0); // 100
+  featureVector.push(/[A-Z]$/.test(text) ? 1 : 0); // 101
+	console.log(featureVector)
+  return featureVector;
+}
+
+
+function switchTab(tabName) {
+  document.getElementById("classificationTab").classList.add("hidden");
+  document.getElementById("resultsTab").classList.add("hidden");
+  document.querySelectorAll(".tabs button").forEach(btn => btn.classList.remove("active-tab"));
+  document.getElementById(tabName + "Tab").classList.remove("hidden");
+  document.querySelector(`.tabs button[onclick*='${tabName}']`).classList.add("active-tab");
+  if (tabName === 'results') updateResultsTable();
+}
+
+function renderColumn(columnIndex) {
+  storedColumnIndex = columnIndex;
+  const container = document.getElementById("rowsContainer");
+  container.innerHTML = "";
+  const table = document.createElement("table");
+  table.className = "manual-table";
+
+  const predictions = classifiers[columnIndex] ? parsedData.map(row => {
+    const val = row[columnIndex]?.trim() || "";
+    const features = extractFeatures(val);
+    return classifiers[columnIndex].predict([features])[0];
+  }) : [];
+
+  for (let i = 0; i < parsedData.length; i++) {
+    const val = parsedData[i][columnIndex] || "";
+    const labelValue = labels[columnIndex]?.[i] || "";
+    const row = document.createElement("tr");
+    let bg = labelValue === 'positive' ? '#d4ffd4' : labelValue === 'negative' ? '#ffd4d4' : '';
+    if (!bg && predictions.length > i) {
+      bg = predictions[i] === 1 ? '#d4ffd4' : '#ffd4d4';
+    }
+    row.style.backgroundColor = bg;
+
+    const valCell = document.createElement("td");
+    valCell.textContent = val;
+
+    const btnCell = document.createElement("td");
+    btnCell.innerHTML = `
+      <button class="label-btn" onclick="labelRow(${columnIndex}, ${i}, 'positive')">👍</button>
+      <button class="label-btn" onclick="labelRow(${columnIndex}, ${i}, 'negative')">👎</button>
+      <button class="label-btn" onclick="duplicateRow(${i})">📄</button>
+    `;
+
+    row.appendChild(valCell);
+    row.appendChild(btnCell);
+    table.appendChild(row);
+  }
+
+  container.appendChild(table);
+}
+
+function duplicateRow(index) {
+  if (!parsedData[index]) return;
+  parsedData.push([...parsedData[index]]);
+  renderColumn(storedColumnIndex);
+}
+
+function labelRow(colIndex, rowIndex, label) {
+  if (!labels[colIndex]) labels[colIndex] = {};
+  labels[colIndex][rowIndex] = label;
+  trainClassifier(colIndex);
+  renderColumn(colIndex);
+  if (!document.getElementById("resultsTab").classList.contains("hidden")) {
+    updateResultsTable();
+  }
+}
+
+function handleNewFile(file) {
+  Papa.parse(file, {
+    complete: function (results) {
+      const fileData = results.data.slice(1);
+      allFilesData.push({ name: file.name, data: fileData });
+      if (parsedData.length === 0) {
+        parsedData = fileData;
+        const select = document.getElementById("columnSelector");
+        select.innerHTML = "";
+        resultsHeaders = results.data[0];
+        for (let i = 0; i < resultsHeaders.length; i++) {
+          const option = document.createElement("option");
+          option.value = i;
+          option.textContent = resultsHeaders[i];
+          select.appendChild(option);
+        }
+        select.addEventListener("change", () => {
+          renderColumn(select.value);
+          trainClassifier(select.value);
+        });
+        renderColumn(0);
+        trainClassifier(0);
+      }
+    },
+    header: false
+  });
+}
+
+document.getElementById("csvFile").addEventListener("change", function (e) {
+  for (let i = 0; i < e.target.files.length; i++) {
+    handleNewFile(e.target.files[i]);
+  }
+});
+
+document.getElementById("testCsvFile").addEventListener("change", function (e) {
+  updateResultsTable(e.target.files);
+});
+
+function updateResultsTable(files) {
+  const resultsTable = document.getElementById("resultsTable");
+  resultsTable.innerHTML = "";
+  if (!files || files.length === 0) {
+    files = document.getElementById("testCsvFile").files;
+  }
+  for (let f = 0; f < files.length; f++) {
+    const file = files[f];
+    Papa.parse(file, {
+      complete: function (results) {
+        const fileData = results.data.slice(1);
+        const headers = results.data[0];
+
+        const table = document.createElement("table");
+        let headerRow = document.createElement("tr");
+        headers.forEach((h, i) => {
+          const th = document.createElement("th");
+          th.textContent = h + ' ⇅';
+          th.onclick = () => sortTable(table, i);
+          headerRow.appendChild(th);
+        });
+        table.appendChild(headerRow);
+
+        let negativeByColumn = headers.map(() => []);
+        let positiveByColumn = headers.map(() => []);
+
+        for (let i = 0; i < fileData.length; i++) {
+          const row = document.createElement("tr");
+          headers.forEach((_, colIndex) => {
+            const val = fileData[i][colIndex]?.trim() || "";
+            let bg = "white";
+            if (classifiers[colIndex]) {
+              try {
+                const pred = classifiers[colIndex].predict([extractFeatures(val)])[0];
+                if (pred === 0) {
+                  bg = "#ffd4d4";
+                  negativeByColumn[colIndex].push(val);
+                } else {
+                  positiveByColumn[colIndex].push(val);
+                }
+              } catch {}
+            }
+            const cell = document.createElement("td");
+            cell.style.backgroundColor = bg;
+            cell.textContent = val;
+            row.appendChild(cell);
+          });
+          table.appendChild(row);
+        }
+
+        resultsTable.appendChild(table);
+
+        headers.forEach((_, colIndex) => {
+          const box = document.createElement("textarea");
+          box.className = 'negative-values-box';
+          box.placeholder = `Negative values from column ${headers[colIndex]}`;
+          box.value = negativeByColumn[colIndex].join("\n");
+          resultsTable.appendChild(box);
+        });
+
+        resultsTable.appendChild(document.createElement("hr"));
+
+        headers.forEach((_, colIndex) => {
+          const box = document.createElement("textarea");
+          box.className = 'positive-values-box';
+          box.placeholder = `Positive values from column ${headers[colIndex]}`;
+          box.value = positiveByColumn[colIndex].join("\n");
+          resultsTable.appendChild(box);
+        });
+      }
+    });
+  }
+}
+
+function sortTable(table, colIndex) {
+  const rows = Array.from(table.rows).slice(1);
+  const sorted = rows.sort((a, b) => a.cells[colIndex].textContent.localeCompare(b.cells[colIndex].textContent));
+  sorted.forEach(row => table.appendChild(row));
+}
+</script>
+
+<script type="module">
+  import { DecisionTreeClassifier } from 'https://cdn.jsdelivr.net/npm/ml-cart@2.1.1/+esm';
+
+  window.trainClassifier = function(colIndex) {
+    const X = [];
+    const y = [];
+    const colLabels = labels[colIndex] || {};
+
+    for (let index in colLabels) {
+      const val = parsedData[index]?.[colIndex];
+      if (!val || typeof val !== "string") continue;
+      const features = extractFeatures(val);
+      if (Array.isArray(features) && features.length > 0) {
+        X.push(features);
+        y.push(colLabels[index] === 'positive' ? 1 : 0);
+      }
+    }
+
+    if (X.length >= 2 && Array.isArray(X[0]) && X[0].length > 0) {
+      try {
+        const classifier = new DecisionTreeClassifier();
+        classifier.train(X, y);
+        classifiers[colIndex] = classifier;
+      } catch (err) {
+        console.error("❌ Classifier training failed:", err);
+      }
+    } else {
+      console.warn("❌ Not enough valid training data to train classifier on column", colIndex);
+    }
+  };
+</script>
+
+</body>
+</html>
