@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CSV Labeling & Classifier Trainer</title>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/nikolajkh/regex-generator@latest/regexgen.min.js"></script>
+  <style>
+    body { font-family: Arial; padding: 1em; }
+    .hidden { display: none; }
+    .tabs button { margin-right: 10px; padding: 8px 12px; cursor: pointer; }
+    .active-tab { background-color: #ddd; }
+    .label-btn { margin: 0 4px; }
+    #reportBtn, #generateRegexBtn { padding: 10px; margin-top: 10px; }
+    #regexBox { white-space: pre-wrap; background: #f0f0f0; padding: 1em; border: 1px solid #ccc; margin-top: 10px; }
+    th { cursor: pointer; }
+    td.editable { cursor: pointer; }
+    td.editable:hover { background-color: #eef; }
+    table { border-collapse: collapse; margin-bottom: 20px; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; }
+    .negative-values-box { width: 100%; height: 80px; margin-top: 5px; white-space: pre-wrap; background: #f9f9f9; border: 1px solid #ccc; padding: 5px; font-family: monospace; }
+  </style>
+</head>
+<body>
+
+<div class="tabs">
+  <button onclick="switchTab('classification')" class="active-tab">Manual Classification</button>
+  <button onclick="switchTab('results')">Predicted Output</button>
+</div>
+
+<div id="classificationTab">
+  <h2>Train Classifier</h2>
+  <input type="file" id="csvFile" accept=".csv" multiple><br><br>
+  <select id="columnSelector"></select>
+  <div id="rowsContainer"></div>
+  <button id="generateRegexBtn">Generate Regex</button>
+  <div id="regexBox"></div>
+</div>
+
+<div id="resultsTab" class="hidden">
+  <h2>Test Classifier on New CSVs</h2>
+  <input type="file" id="testCsvFile" accept=".csv" multiple><br><br>
+  <button id="reportBtn">Download Negative Report</button>
+  <div id="resultsTable"></div>
+</div>
+
+<script>
+let allFilesData = [];
+let parsedData = [];
+let labels = {};
+let classifiers = {};
+let storedColumnIndex = 0;
+let resultsHeaders = [];
+
+function extractFeatures(text) {
+  return [
+    text.length,
+    (text.match(/\d/g) || []).length,
+    (text.match(/-/g) || []).length,
+    text.trim().split(" ").length,
+    /^X+$/.test(text) ? 1 : 0
+  ];
+}
+
+function switchTab(tabName) {
+  document.getElementById("classificationTab").classList.add("hidden");
+  document.getElementById("resultsTab").classList.add("hidden");
+  document.querySelectorAll(".tabs button").forEach(btn => btn.classList.remove("active-tab"));
+  document.getElementById(tabName + "Tab").classList.remove("hidden");
+  document.querySelector(`.tabs button[onclick*='${tabName}']`).classList.add("active-tab");
+  if (tabName === 'results') updateResultsTable();
+}
+
+function renderColumn(columnIndex) {
+  storedColumnIndex = columnIndex;
+  const container = document.getElementById("rowsContainer");
+  container.innerHTML = "";
+  const classifier = classifiers[columnIndex];
+
+  for (let i = 0; i < parsedData.length; i++) {
+    const val = parsedData[i][columnIndex] || "";
+    const labelValue = labels[columnIndex]?.[i] || "";
+
+    let bg = "";
+    if (labelValue === 'positive') bg = '#d4ffd4';
+    else if (labelValue === 'negative') bg = '#ffd4d4';
+    else if (classifier) {
+      try {
+        const prediction = classifier.predict([extractFeatures(val)])[0];
+        bg = prediction === 1 ? '#d4ffd4' : '#ffd4d4';
+      } catch {}
+    }
+
+    const row = document.createElement("div");
+    row.style.backgroundColor = bg;
+    row.innerHTML = `
+      <code>${val}</code>
+      <button class="label-btn" onclick="labelRow(${columnIndex}, ${i}, 'positive')">👍</button>
+      <button class="label-btn" onclick="labelRow(${columnIndex}, ${i}, 'negative')">👎</button>
+    `;
+    container.appendChild(row);
+  }
+}
+
+function labelRow(colIndex, rowIndex, label) {
+  if (!labels[colIndex]) labels[colIndex] = {};
+  labels[colIndex][rowIndex] = label;
+  trainClassifier(colIndex);
+  renderColumn(colIndex);
+  if (!document.getElementById("resultsTab").classList.contains("hidden")) {
+    updateResultsTable();
+  }
+}
+
+function handleNewFile(file) {
+  Papa.parse(file, {
+    complete: function (results) {
+      const fileData = results.data.slice(1);
+      allFilesData.push({ name: file.name, data: fileData });
+      if (parsedData.length === 0) {
+        parsedData = fileData;
+        const select = document.getElementById("columnSelector");
+        select.innerHTML = "";
+        resultsHeaders = results.data[0];
+        for (let i = 0; i < resultsHeaders.length; i++) {
+          const option = document.createElement("option");
+          option.value = i;
+          option.textContent = resultsHeaders[i];
+          select.appendChild(option);
+        }
+        select.addEventListener("change", () => {
+          renderColumn(select.value);
+          trainClassifier(select.value);
+        });
+        renderColumn(0);
+        trainClassifier(0);
+      }
+    },
+    header: false
+  });
+}
+
+document.getElementById("csvFile").addEventListener("change", function (e) {
+  for (let i = 0; i < e.target.files.length; i++) {
+    handleNewFile(e.target.files[i]);
+  }
+});
+
+document.getElementById("testCsvFile").addEventListener("change", function (e) {
+  updateResultsTable(e.target.files);
+});
+
+function updateResultsTable(files) {
+  const resultsTable = document.getElementById("resultsTable");
+  resultsTable.innerHTML = "";
+  if (!files || files.length === 0) {
+    files = document.getElementById("testCsvFile").files;
+  }
+  for (let f = 0; f < files.length; f++) {
+    const file = files[f];
+    Papa.parse(file, {
+      complete: function (results) {
+        const fileData = results.data.slice(1);
+        const headers = results.data[0];
+
+        const table = document.createElement("table");
+        let headerRow = document.createElement("tr");
+        headers.forEach(h => {
+          const th = document.createElement("th");
+          th.textContent = h;
+          headerRow.appendChild(th);
+        });
+        table.appendChild(headerRow);
+
+        let negativeByColumn = headers.map(() => []);
+
+        for (let i = 0; i < fileData.length; i++) {
+          const row = document.createElement("tr");
+          headers.forEach((_, colIndex) => {
+            const val = fileData[i][colIndex] || "";
+            let bg = "white";
+            if (classifiers[colIndex]) {
+              try {
+                const pred = classifiers[colIndex].predict([extractFeatures(val)])[0];
+                if (pred === 0) {
+                  bg = "#ffd4d4";
+                  negativeByColumn[colIndex].push(val);
+                }
+              } catch {}
+            }
+            const cell = document.createElement("td");
+            cell.style.backgroundColor = bg;
+            cell.textContent = val;
+            row.appendChild(cell);
+          });
+          table.appendChild(row);
+        }
+
+        resultsTable.appendChild(table);
+
+        headers.forEach((_, colIndex) => {
+          const box = document.createElement("textarea");
+          box.className = 'negative-values-box';
+          box.placeholder = `Negative values from column ${headers[colIndex]}`;
+          box.value = negativeByColumn[colIndex].join("\n");
+          resultsTable.appendChild(box);
+        });
+      }
+    });
+  }
+}
+</script>
+
+<script type="module">
+  import { DecisionTreeClassifier } from 'https://cdn.jsdelivr.net/npm/ml-cart@2.1.1/+esm';
+
+  window.trainClassifier = function(colIndex) {
+    const X = [];
+    const y = [];
+    const colLabels = labels[colIndex] || {};
+
+    for (let index in colLabels) {
+      const val = parsedData[index]?.[colIndex];
+      if (!val || typeof val !== "string") continue;
+      const features = extractFeatures(val);
+      if (Array.isArray(features) && features.length > 0) {
+        X.push(features);
+        y.push(colLabels[index] === 'positive' ? 1 : 0);
+      }
+    }
+
+    if (X.length >= 2 && Array.isArray(X[0]) && X[0].length > 0) {
+      try {
+        const classifier = new DecisionTreeClassifier();
+        classifier.train(X, y);
+        classifiers[colIndex] = classifier;
+
+        const predictions = parsedData.map(row => {
+          const val = row[colIndex] || "";
+          const features = extractFeatures(val);
+          return classifier.predict([features])[0];
+        });
+
+        const container = document.getElementById("rowsContainer");
+        const rows = container.children;
+        for (let i = 0; i < rows.length; i++) {
+          const labelValue = labels[colIndex]?.[i];
+          rows[i].style.backgroundColor = labelValue === 'positive' ? '#d4ffd4' : labelValue === 'negative' ? '#ffd4d4' : (predictions[i] === 1 ? '#d4ffd4' : '#ffd4d4');
+        }
+      } catch (err) {
+        console.error("❌ Classifier training failed:", err);
+      }
+    } else {
+      console.warn("❌ Not enough valid training data to train classifier on column", colIndex);
+    }
+  };
+</script>
+
+</body>
+</html>
