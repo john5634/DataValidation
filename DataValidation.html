@@ -18,7 +18,9 @@
     td.editable:hover { background-color: #eef; }
     table { border-collapse: collapse; margin-bottom: 20px; }
     th, td { border: 1px solid #ccc; padding: 6px 8px; }
-    .negative-values-box { width: 100%; height: 80px; margin-top: 5px; white-space: pre-wrap; background: #f9f9f9; border: 1px solid #ccc; padding: 5px; font-family: monospace; }
+    .negative-values-box, .positive-values-box { width: 100%; height: 80px; margin-top: 5px; white-space: pre-wrap; background: #f9f9f9; border: 1px solid #ccc; padding: 5px; font-family: monospace; }
+    .manual-table td:first-child { width: auto; max-width: 500px; word-break: break-word; }
+    hr { margin: 30px 0; }
   </style>
 </head>
 <body>
@@ -53,6 +55,7 @@ let storedColumnIndex = 0;
 let resultsHeaders = [];
 
 function extractFeatures(text) {
+  text = String(text).trim();
   return [
     text.length,
     (text.match(/\d/g) || []).length,
@@ -75,31 +78,47 @@ function renderColumn(columnIndex) {
   storedColumnIndex = columnIndex;
   const container = document.getElementById("rowsContainer");
   container.innerHTML = "";
-  const classifier = classifiers[columnIndex];
+  const table = document.createElement("table");
+  table.className = "manual-table";
+
+  const predictions = classifiers[columnIndex] ? parsedData.map(row => {
+    const val = row[columnIndex]?.trim() || "";
+    const features = extractFeatures(val);
+    return classifiers[columnIndex].predict([features])[0];
+  }) : [];
 
   for (let i = 0; i < parsedData.length; i++) {
     const val = parsedData[i][columnIndex] || "";
     const labelValue = labels[columnIndex]?.[i] || "";
-
-    let bg = "";
-    if (labelValue === 'positive') bg = '#d4ffd4';
-    else if (labelValue === 'negative') bg = '#ffd4d4';
-    else if (classifier) {
-      try {
-        const prediction = classifier.predict([extractFeatures(val)])[0];
-        bg = prediction === 1 ? '#d4ffd4' : '#ffd4d4';
-      } catch {}
+    const row = document.createElement("tr");
+    let bg = labelValue === 'positive' ? '#d4ffd4' : labelValue === 'negative' ? '#ffd4d4' : '';
+    if (!bg && predictions.length > i) {
+      bg = predictions[i] === 1 ? '#d4ffd4' : '#ffd4d4';
     }
-
-    const row = document.createElement("div");
     row.style.backgroundColor = bg;
-    row.innerHTML = `
-      <code>${val}</code>
+
+    const valCell = document.createElement("td");
+    valCell.textContent = val;
+
+    const btnCell = document.createElement("td");
+    btnCell.innerHTML = `
       <button class="label-btn" onclick="labelRow(${columnIndex}, ${i}, 'positive')">👍</button>
       <button class="label-btn" onclick="labelRow(${columnIndex}, ${i}, 'negative')">👎</button>
+      <button class="label-btn" onclick="duplicateRow(${i})">📄</button>
     `;
-    container.appendChild(row);
+
+    row.appendChild(valCell);
+    row.appendChild(btnCell);
+    table.appendChild(row);
   }
+
+  container.appendChild(table);
+}
+
+function duplicateRow(index) {
+  if (!parsedData[index]) return;
+  parsedData.push([...parsedData[index]]);
+  renderColumn(storedColumnIndex);
 }
 
 function labelRow(colIndex, rowIndex, label) {
@@ -165,19 +184,21 @@ function updateResultsTable(files) {
 
         const table = document.createElement("table");
         let headerRow = document.createElement("tr");
-        headers.forEach(h => {
+        headers.forEach((h, i) => {
           const th = document.createElement("th");
-          th.textContent = h;
+          th.textContent = h + ' ⇅';
+          th.onclick = () => sortTable(table, i);
           headerRow.appendChild(th);
         });
         table.appendChild(headerRow);
 
         let negativeByColumn = headers.map(() => []);
+        let positiveByColumn = headers.map(() => []);
 
         for (let i = 0; i < fileData.length; i++) {
           const row = document.createElement("tr");
           headers.forEach((_, colIndex) => {
-            const val = fileData[i][colIndex] || "";
+            const val = fileData[i][colIndex]?.trim() || "";
             let bg = "white";
             if (classifiers[colIndex]) {
               try {
@@ -185,6 +206,8 @@ function updateResultsTable(files) {
                 if (pred === 0) {
                   bg = "#ffd4d4";
                   negativeByColumn[colIndex].push(val);
+                } else {
+                  positiveByColumn[colIndex].push(val);
                 }
               } catch {}
             }
@@ -205,9 +228,25 @@ function updateResultsTable(files) {
           box.value = negativeByColumn[colIndex].join("\n");
           resultsTable.appendChild(box);
         });
+
+        resultsTable.appendChild(document.createElement("hr"));
+
+        headers.forEach((_, colIndex) => {
+          const box = document.createElement("textarea");
+          box.className = 'positive-values-box';
+          box.placeholder = `Positive values from column ${headers[colIndex]}`;
+          box.value = positiveByColumn[colIndex].join("\n");
+          resultsTable.appendChild(box);
+        });
       }
     });
   }
+}
+
+function sortTable(table, colIndex) {
+  const rows = Array.from(table.rows).slice(1);
+  const sorted = rows.sort((a, b) => a.cells[colIndex].textContent.localeCompare(b.cells[colIndex].textContent));
+  sorted.forEach(row => table.appendChild(row));
 }
 </script>
 
@@ -234,19 +273,6 @@ function updateResultsTable(files) {
         const classifier = new DecisionTreeClassifier();
         classifier.train(X, y);
         classifiers[colIndex] = classifier;
-
-        const predictions = parsedData.map(row => {
-          const val = row[colIndex] || "";
-          const features = extractFeatures(val);
-          return classifier.predict([features])[0];
-        });
-
-        const container = document.getElementById("rowsContainer");
-        const rows = container.children;
-        for (let i = 0; i < rows.length; i++) {
-          const labelValue = labels[colIndex]?.[i];
-          rows[i].style.backgroundColor = labelValue === 'positive' ? '#d4ffd4' : labelValue === 'negative' ? '#ffd4d4' : (predictions[i] === 1 ? '#d4ffd4' : '#ffd4d4');
-        }
       } catch (err) {
         console.error("❌ Classifier training failed:", err);
       }
